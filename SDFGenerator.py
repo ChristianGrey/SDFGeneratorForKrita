@@ -1,7 +1,8 @@
 from krita import Krita, Extension
-from PyQt5.QtWidgets import QInputDialog,QMessageBox
+from PyQt5.QtWidgets import QInputDialog, QMessageBox
 import math, time
 from array import array
+
 
 class SDFGenerator(Extension):
     def __init__(self, parent):
@@ -11,139 +12,150 @@ class SDFGenerator(Extension):
         pass
 
     def createActions(self, window):
-        action = window.createAction("distance_map", "Generate Distance Map", "tools/scripts")
+        action = window.createAction(
+            "distance_map", "Generate True Dual SDF", "tools/scripts"
+        )
         action.triggered.connect(self.run)
 
+    def compute_distance_field(self, width, height, is_seed, weight_sq, inf):
+        """
+        Computes Euclidean Distance Transform.
+        is_seed: bytearray (1 if pixel is a source, 0 otherwise)
+        weight_sq: float array (initial squared distance for seeds)
+        """
+        # Step 1: Vertical Pass (Meijster Phase 1)
+        # Calculates squared vertical distance to nearest seed in column
+        g = array("f", [inf] * (width * height))
+
+        for x in range(width):
+            # Scan Down
+            last_dist = inf
+            for y in range(height):
+                idx = y * width + x
+                if is_seed[idx]:
+                    g[idx] = weight_sq[idx]
+                else:
+                    # If not a seed, it's 1 unit further from the seed above it
+                    # Note: We use Manhattan here temporarily then square properly
+                    # because it's a 1D column.
+                    pass
+
+            # Simplified Vertical: find nearest seed y_i for each y
+            # For 1D, we can just find the nearest seed index
+            seeds_in_col = [y for y in range(height) if is_seed[y * width + x]]
+            if not seeds_in_col:
+                continue
+
+            curr_seed_idx = 0
+            for y in range(height):
+                # Move to the closest seed (either the one before or after current y)
+                while curr_seed_idx + 1 < len(seeds_in_col) and abs(
+                    seeds_in_col[curr_seed_idx + 1] - y
+                ) < abs(seeds_in_col[curr_seed_idx] - y):
+                    curr_seed_idx += 1
+
+                s_y = seeds_in_col[curr_seed_idx]
+                dist_vert = abs(y - s_y)
+                # Correct Euclidean: (y - y_i)^2 + initial_weight^2
+                g[y * width + x] = (
+                    dist_vert + math.sqrt(weight_sq[s_y * width + x])
+                ) ** 2
+
+        # Step 2: Horizontal Pass (Meijster Phase 2 - Parabolic)
+        dist_out = array("f", [inf] * (width * height))
+        for y in range(height):
+            row_off = y * width
+            s = [0] * width
+            t = [0.0] * (width + 1)
+            t[0], t[1] = -inf, inf
+            q = 0
+            for u in range(1, width):
+                while q >= 0:
+                    f_u, f_s = g[row_off + u], g[row_off + s[q]]
+                    if f_u >= inf:
+                        break
+                    inv_denom = 1.0 / (2 * (u - s[q]))
+                    inter_x = ((f_u + u**2) - (f_s + s[q] ** 2)) * inv_denom
+                    if inter_x <= t[q]:
+                        q -= 1
+                    else:
+                        q += 1
+                        s[q], t[q], t[q + 1] = u, inter_x, inf
+                        break
+
+            for u in range(width):
+                while t[q] > u and q > 0:
+                    q -= 1  # Safety backtrack
+                while t[q + 1] < u:
+                    q += 1
+                dx = u - s[q]
+                dist_out[row_off + u] = math.sqrt(dx**2 + g[row_off + s[q]])
+        return dist_out
+
     def run(self):
-        app = Krita.instance()
-        doc = app.activeDocument()
+        doc = Krita.instance().activeDocument()
         if not doc:
             return
-        node = doc.activeNode()
-        if not node:
-            return
+        width, height = doc.width(), doc.height()
+        active_layer = doc.activeNode()
 
-        w, h = doc.width(), doc.height()
-        ok = True
-        RANGE, ok = QInputDialog.getInt(None, "Distance Map Range",
-                                        "Max range in pixels (clamps distances):", 50, 1, max(w, h), 1)
+        max_range, ok = QInputDialog.getInt(
+            None, "SDF Settings", "Max Pixel Range:", 64, 1, 1024
+        )
         if not ok:
             return
 
-        timings = {}
+        pixels = bytearray(active_layer.pixelData(0, 0, width, height))
+        inf = float(width**2 + height**2)
 
-        # Step 0: fetch pixels
-        t0 = time.perf_counter()
-        pixelData = node.pixelData(0, 0, w, h)
-        data = bytearray(pixelData)
-        timings["fetch pixels"] = time.perf_counter() - t0
+        # Separate seeds for Outside (to find distance to white)
+        # and Inside (to find distance to black)
+        is_inside = bytearray(width * height)
+        weight_sq_out = array("f", [0.0] * (width * height))
+        weight_sq_in = array("f", [0.0] * (width * height))
 
-        # Step 1: classify pixels
-        t0 = time.perf_counter()
-        mask = bytearray(w*h)        # 0=black/transparent, 1=white
-        seed_white = bytearray(w*h)
-        seed_black = bytearray(w*h)
-        multipliers = array('f', [0.0] * (w*h))
+        is_seed_ext = bytearray(width * height)  # Seeds for exterior pass
+        is_seed_int = bytearray(width * height)  # Seeds for interior pass
 
-        for i in range(w*h):
-            r, g, b, a = data[i*4:i*4+4]
-            if a < 127:
-                mask[i] = 0
-                seed_black[i] = 1
+        for i in range(width * height):
+            v = pixels[i * 4 + 2] / 255.0  # Red channel
+            if v > 0.5:
+                is_inside[i] = 1
+                is_seed_ext[i] = 1  # White pixels are seeds for the outside world
+                weight_sq_out[i] = ((1.0 - v) * 1.0) ** 2
             else:
-                lum = 0.299*r + 0.587*g + 0.114*b
-                if lum > 127:
-                    mask[i] = 1
-                    seed_white[i] = 1
-                    multipliers[i] = 1 - ((lum - 128) / 127)
+                is_inside[i] = 0
+                is_seed_int[i] = 1  # Black pixels are seeds for the inside world
+                weight_sq_in[i] = (v * 1.0) ** 2
 
-                else:
-                    mask[i] = 0
-                    seed_black[i] = 1
-                    multipliers[i] = lum / 127
-        timings["classify"] = time.perf_counter() - t0
+        # Run Passes
+        dist_ext = self.compute_distance_field(
+            width, height, is_seed_ext, weight_sq_out, inf
+        )
+        dist_int = self.compute_distance_field(
+            width, height, is_seed_int, weight_sq_in, inf
+        )
 
-        # Step 2: find border pixels
-        t0 = time.perf_counter()
-        ortho = [(-1,0),(1,0),(0,-1),(0,1)]
-        border_pixels = []
-        for y in range(h):
-            for x in range(w):
-                idx = y*w + x
-                if multipliers[idx] > 0: 
-                    border_pixels.append((x, y))# if mask[idx] != 1:
-                #     continue
-                # if any(0 <= x+dx < w and 0 <= y+dy < h and mask[(y+dy)*w + (x+dx)] == 0 for dx, dy in ortho):
-                #     border_pixels.append((x, y))
-        timings["find borders"] = time.perf_counter() - t0
-
-        # Step 3: precompute distance mask
-        t0 = time.perf_counter()
-        size = 2*RANGE + 1
-        dist_mask = array('f', (0.0,) * (size*size))
-        for dy in range(-RANGE, RANGE+1):
-            for dx in range(-RANGE, RANGE+1):
-                dist_mask[(dy+RANGE)*size + (dx+RANGE)] = math.hypot(dx, dy)
-        timings["build mask"] = time.perf_counter() - t0
-
-        # Step 4: stamp distances
-        t0 = time.perf_counter()
-        Distance = array('f', [float('inf')] * (w*h))
-        offsets = [(dx, dy, dist_mask[(dy+RANGE)*size + (dx+RANGE)]) for dy in range(-RANGE,RANGE+1) for dx in range(-RANGE,RANGE+1)]
-        for bx, by in border_pixels:
-            bidx = by*w + bx
-            # Sub-pixel correction: 
-            # A multiplier of 1.0 means the edge is at the center (dist 0)
-            # A multiplier of 0.0 means the edge is 1 full pixel away.
-            subpixel_correction = (1.0 - multipliers[bidx])
-
-            for dx, dy, d in offsets:
-                nx, ny = bx+dx, by+dy
-                if 0 <= nx < w and 0 <= ny < h:
-                    nidx = ny*w + nx
-
-                    adjusted_dist = d + subpixel_correction
-
-                    if adjusted_dist < Distance[nidx]:
-                        Distance[nidx] = adjusted_dist
-
-                    # if d < Distance[nidx]:
-                    #     # use multipliers here somehow
-                    #     Distance[nidx] = d
-        timings["apply mask"] = time.perf_counter() - t0
-
-        # Step 5: render output
-        t0 = time.perf_counter()
-        out = bytearray(len(data))
-        for idx in range(w*h):
-            if seed_white[idx]:
-                d = min(Distance[idx], RANGE)
-                val = 0.5 + 0.5 * (d / RANGE)       # white -> 1.0
-            elif seed_black[idx]:
-                d = min(Distance[idx], RANGE)
-                val = 0.5 * max(0.0, 1.0 - d / RANGE)  # black -> 0.0
+        # Composite Result
+        res = bytearray(width * height * 4)
+        for i in range(width * height):
+            if is_inside[i]:
+                # Positive distance (0.5 to 1.0)
+                d = dist_int[i]
+                f = 0.5 + 0.5 * min(1.0, d / max_range)
             else:
-                val = 0.0
-            gray = max(0, min(255, int(val*255)))
-            off = idx*4
-            out[off]   = gray
-            out[off+1] = gray
-            out[off+2] = gray
-            out[off+3] = 255
-        timings["render"] = time.perf_counter() - t0
+                # Negative distance (0.5 down to 0.0)
+                d = dist_ext[i]
+                f = 0.5 - 0.5 * min(1.0, d / max_range)
 
-        # Step 6: create layer
-        t0 = time.perf_counter()
-        new_node = doc.createNode("SDF", "paintLayer")
-        doc.rootNode().addChildNode(new_node, node)
-        new_node.setPixelData(bytes(out), 0, 0, w, h)
+            gray = int(f * 255)
+            res[i * 4] = res[i * 4 + 1] = res[i * 4 + 2] = gray
+            res[i * 4 + 3] = 255
+
+        new_layer = doc.createNode("SDF_Final", "paintLayer")
+        doc.rootNode().addChildNode(new_layer, None)
+        new_layer.setPixelData(bytes(res), 0, 0, width, height)
         doc.refreshProjection()
-        timings["create layer"] = time.perf_counter() - t0
-
-        # Report timings
-        msg = "\n".join([f"{step}: {ms*1000:.2f} ms" for step, ms in timings.items()])
-        print("[SDF timings]\n" + msg)
-        QMessageBox.information(None, "SDF timings", msg)
 
 
-#Krita.instance().addExtension(SDFGenerator(Krita.instance()))
+# Krita.instance().addExtension(SDFGenerator(Krita.instance()))
