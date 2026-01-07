@@ -212,11 +212,11 @@ class SDFGenerator(Extension):
             dist = math.sqrt(grid_dx[i] ** 2 + grid_dy[i] ** 2) + additional_dist[s_idx]
             # Normalize to 0.0 - 1.0 (0.5 is edge)
             if is_inside[i]:
-                # val = 0.5 + 0.5 * (min(dist, max_range) / max_range)
+                # temp, we didn't make inside distances yet
                 val = 1
             else:
                 # val = 0.5 * (1.0 - min(dist, max_range) / max_range)
-                val = remap_clamped(dist, 0, max_range + 1, 1, 0)
+                val = remap_clamped(dist, 0, max_range + 1, 0.5, 0)
 
             gray = int(val * 255)
             offset = i * 4
