@@ -58,28 +58,35 @@ class SDFGenerator(Extension):
         # is_inside stores the binary state (solid or not)
         is_inside = bytearray(total_pixels)
         # weight stores the subpixel edge offset (0.0 to 1.0)
-        weights = array("f", [0.0] * total_pixels)
+        # weights = array("f", [0.0] * total_pixels)
+        additional_dist = array("f", [0.0] * total_pixels)
 
         for i in range(total_pixels):
-            off = i * 4
-            r, g, b, a = pixels[off], pixels[off + 1], pixels[off + 2], pixels[off + 3]
+            offset = i * 4
+            r, g, b, a = (
+                pixels[offset],
+                pixels[offset + 1],
+                pixels[offset + 2],
+                pixels[offset + 3],
+            )
 
             # Simple luminance + alpha check
             lum = 0.299 * r + 0.587 * g + 0.114 * b
-            if a > 127 and lum > 127:
+            if lum > 1:
                 is_inside[i] = 1
                 # Subpixel: how far inside are we?
-                weights[i] = 1.0 - ((lum - 128) / 127)
+                # weights[i] = 1.0 - ((lum - 128) / 127)
                 # Seed the boundary
+                additional_dist[i] = 1.0 - (lum / 255)
                 grid_dx[i] = 0.0
                 grid_dy[i] = 0.0
             else:
                 is_inside[i] = 0
-                weights[i] = lum / 127
+                # weights[i] = lum / 127
                 # Seed the boundary if it has some luminance
-                if lum > 0:
-                    grid_dx[i] = 0.0
-                    grid_dy[i] = 0.0
+                # if lum > 0:
+                #     grid_dx[i] = 0.0
+                #     grid_dy[i] = 0.0
         timings["Init"] = time.perf_counter() - t0
 
         # ---------------------------------------------------------
@@ -87,18 +94,57 @@ class SDFGenerator(Extension):
         # ---------------------------------------------------------
         t0 = time.perf_counter()
 
+        def index_to_coords(index, width):
+            y = int(index // width)
+            x = int(index % width)
+            return x, y
+
+        def coords_to_index(x, y, width):
+            return int(y * width + x)
+
         # offset from neighbor to target in coordinates
-        def compare_and_update(target_idx, neighbor_idx, offset_x, offset_y):
+        def compare_and_update(current_idx, neighbor_idx, offset_x, offset_y):
+            # Cache current distance sqr
+            curr_x_coord, curr_y_coord = index_to_coords(current_idx, width)
+            curr_offset_x = grid_dx[current_idx]
+            curr_offset_y = grid_dy[current_idx]
+            # Get additional distance for current pos
+            closest_point_to_curr_idx = coords_to_index(
+                curr_x_coord + curr_offset_x, curr_y_coord + curr_offset_y, width
+            )
+            curr_additional_dist = additional_dist[closest_point_to_curr_idx]
+            curr_dist = (
+                curr_offset_x * curr_offset_x
+                + curr_offset_y * curr_offset_y
+                + curr_additional_dist * curr_additional_dist
+            )
+
             # Calculate new vector
-            new_x = grid_dx[neighbor_idx] + offset_x
-            new_y = grid_dy[neighbor_idx] + offset_y
+            neighbor_offset_x = grid_dx[neighbor_idx]
+            neighbor_offset_y = grid_dy[neighbor_idx]
+            new_x = neighbor_offset_x + offset_x
+            new_y = neighbor_offset_y + offset_y
+
+            # Get additional distance for neighbor pos
+            neighbor_x_coord, neighbor_y_coord = index_to_coords(neighbor_idx, width)
+            closest_point_to_neighbor_idx = coords_to_index(
+                neighbor_x_coord + neighbor_offset_x,
+                neighbor_y_coord + neighbor_offset_y,
+                width,
+            )
+            neighbor_additional_dist = additional_dist[closest_point_to_neighbor_idx]
+            neighbor_dist = (
+                new_x * new_x
+                + new_y * new_y
+                + neighbor_additional_dist * neighbor_additional_dist
+            )
 
             # Compare squared distances (faster than sqrt)
-            new_dist_sq = new_x * new_x + new_y * new_y
-            curr_x, curr_y = grid_dx[target_idx], grid_dy[target_idx]
-            if new_dist_sq < (curr_x * curr_x + curr_y * curr_y):
-                grid_dx[target_idx] = new_x
-                grid_dy[target_idx] = new_y
+            # new_dist_sq = new_x * new_x + new_y * new_y
+            # curr_x, curr_y = grid_dx[current_idx], grid_dy[current_idx]
+            if neighbor_dist < curr_dist:
+                grid_dx[current_idx] = new_x
+                grid_dy[current_idx] = new_y
 
         # 1 Pass: Top-Left to Bottom-Right
         for y in range(height):
@@ -189,7 +235,7 @@ class SDFGenerator(Extension):
         out = bytearray(total_pixels * 4)
         for i in range(total_pixels):
             # Final Euclidean Distance + subpixel tweak
-            dist = math.sqrt(grid_dx[i] ** 2 + grid_dy[i] ** 2) + (1.0 - weights[i])
+            dist = math.sqrt(grid_dx[i] ** 2 + grid_dy[i] ** 2)  # + (1.0 - weights[i])
 
             # Normalize to 0.0 - 1.0 (0.5 is edge)
             if is_inside[i]:
@@ -198,9 +244,9 @@ class SDFGenerator(Extension):
                 val = 0.5 * (1.0 - min(dist, max_range) / max_range)
 
             gray = int(val * 255)
-            off = i * 4
-            out[off] = out[off + 1] = out[off + 2] = gray
-            out[off + 3] = 255
+            offset = i * 4
+            out[offset] = out[offset + 1] = out[offset + 2] = gray
+            out[offset + 3] = 255
         timings["Render"] = time.perf_counter() - t0
 
         # Create Layer
