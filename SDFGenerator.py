@@ -57,9 +57,11 @@ class SDFGenerator(Extension):
 
         # is_inside stores the binary state (solid or not)
         is_inside = bytearray(total_pixels)
-        # weight stores the subpixel edge offset (0.0 to 1.0)
-        # weights = array("f", [0.0] * total_pixels)
-        additional_dist = array("f", [0.0] * total_pixels)
+
+        seed_idx = array(
+            "I", [i for i in range(total_pixels)]
+        )  # Track the index of the source pixel
+        additional_dist = array("f", [0.0] * total_pixels)  # Track pre-squared Z-offset
 
         for i in range(total_pixels):
             offset = i * 4
@@ -74,19 +76,15 @@ class SDFGenerator(Extension):
             lum = 0.299 * r + 0.587 * g + 0.114 * b
             if lum > 1:
                 is_inside[i] = 1
-                # Subpixel: how far inside are we?
-                # weights[i] = 1.0 - ((lum - 128) / 127)
                 # Seed the boundary
-                additional_dist[i] = 1.0 - (lum / 255)
                 grid_dx[i] = 0.0
                 grid_dy[i] = 0.0
+                # Subpixel: how far inside are we?
+                z = 1.0 - (lum / 255)
+                additional_dist[i] = z  # * z
             else:
                 is_inside[i] = 0
-                # weights[i] = lum / 127
-                # Seed the boundary if it has some luminance
-                # if lum > 0:
-                #     grid_dx[i] = 0.0
-                #     grid_dy[i] = 0.0
+
         timings["Init"] = time.perf_counter() - t0
 
         # ---------------------------------------------------------
@@ -103,48 +101,35 @@ class SDFGenerator(Extension):
             return int(y * width + x)
 
         # offset from neighbor to target in coordinates
-        def compare_and_update(current_idx, neighbor_idx, offset_x, offset_y):
-            # Cache current distance sqr
-            curr_x_coord, curr_y_coord = index_to_coords(current_idx, width)
-            curr_offset_x = grid_dx[current_idx]
-            curr_offset_y = grid_dy[current_idx]
-            # Get additional distance for current pos
-            closest_point_to_curr_idx = coords_to_index(
-                curr_x_coord + curr_offset_x, curr_y_coord + curr_offset_y, width
+        def compare_and_update(
+            current_idx, neighbor_idx, offset_x, offset_y
+        ):  # Calculate potential new vector using neighbor's existing displacement
+            new_x = grid_dx[neighbor_idx] + offset_x
+            new_y = grid_dy[neighbor_idx] + offset_y
+
+            # Get the seed pixel that this neighbor is currently pointing to
+            neighbor_seed = seed_idx[neighbor_idx]
+
+            # New distance squared = X^2 + Y^2 + Precalculated_Z^2
+            new_dist = (
+                math.sqrt((new_x * new_x) + (new_y * new_y))
+                + additional_dist[neighbor_seed]
             )
-            curr_additional_dist = additional_dist[closest_point_to_curr_idx]
+
+            # Current distance squared
+            curr_seed = seed_idx[current_idx]
             curr_dist = (
-                curr_offset_x * curr_offset_x
-                + curr_offset_y * curr_offset_y
-                + curr_additional_dist * curr_additional_dist
+                math.sqrt(
+                    (grid_dx[current_idx] * grid_dx[current_idx])
+                    + (grid_dy[current_idx] * grid_dy[current_idx])
+                )
+                + additional_dist[curr_seed]
             )
 
-            # Calculate new vector
-            neighbor_offset_x = grid_dx[neighbor_idx]
-            neighbor_offset_y = grid_dy[neighbor_idx]
-            new_x = neighbor_offset_x + offset_x
-            new_y = neighbor_offset_y + offset_y
-
-            # Get additional distance for neighbor pos
-            neighbor_x_coord, neighbor_y_coord = index_to_coords(neighbor_idx, width)
-            closest_point_to_neighbor_idx = coords_to_index(
-                neighbor_x_coord + neighbor_offset_x,
-                neighbor_y_coord + neighbor_offset_y,
-                width,
-            )
-            neighbor_additional_dist = additional_dist[closest_point_to_neighbor_idx]
-            neighbor_dist = (
-                new_x * new_x
-                + new_y * new_y
-                + neighbor_additional_dist * neighbor_additional_dist
-            )
-
-            # Compare squared distances (faster than sqrt)
-            # new_dist_sq = new_x * new_x + new_y * new_y
-            # curr_x, curr_y = grid_dx[current_idx], grid_dy[current_idx]
-            if neighbor_dist < curr_dist:
+            if new_dist < curr_dist:
                 grid_dx[current_idx] = new_x
                 grid_dy[current_idx] = new_y
+                seed_idx[current_idx] = neighbor_seed
 
         # 1 Pass: Top-Left to Bottom-Right
         for y in range(height):
@@ -235,13 +220,15 @@ class SDFGenerator(Extension):
         out = bytearray(total_pixels * 4)
         for i in range(total_pixels):
             # Final Euclidean Distance + subpixel tweak
-            dist = math.sqrt(grid_dx[i] ** 2 + grid_dy[i] ** 2)  # + (1.0 - weights[i])
-
+            s_idx = seed_idx[i]
+            dist = math.sqrt(grid_dx[i] ** 2 + grid_dy[i] ** 2) + additional_dist[s_idx]
             # Normalize to 0.0 - 1.0 (0.5 is edge)
             if is_inside[i]:
-                val = 0.5 + 0.5 * (min(dist, max_range) / max_range)
+                # val = 0.5 + 0.5 * (min(dist, max_range) / max_range)
+                val = 1
             else:
-                val = 0.5 * (1.0 - min(dist, max_range) / max_range)
+                # val = 0.5 * (1.0 - min(dist, max_range) / max_range)
+                val = remap_clamped(dist, 0, max_range + 1, 1, 0)
 
             gray = int(val * 255)
             offset = i * 4
@@ -259,6 +246,16 @@ class SDFGenerator(Extension):
         QMessageBox.information(None, "SDF Result", msg)
 
 
-# Register the extension
-Krita.instance().addExtension(SDFGenerator(Krita.instance()))
+def remap_clamped(value, low1, high1, low2, high2):
+    # Determine the "clamping" bounds
+    out_min, out_max = (low2, high2) if low2 < high2 else (high2, low2)
 
+    # Calculate the remapped value
+    res = (value - low1) / (high1 - low1) * (high2 - low2) + low2
+
+    # Clamp the result
+    return max(out_min, min(out_max, res))
+
+
+# Register the extension
+# Krita.instance().addExtension(SDFGenerator(Krita.instance()))
