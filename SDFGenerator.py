@@ -147,9 +147,9 @@ class SDFGenerator(Extension):
                     if x > 0:  # Top-Left
                         ox, oy = 1.0, 1.0
                         compare_and_update(i, i - width - 1, ox, oy)
-                    if x < width - 1:  # Top-Right
-                        ox, oy = -1.0, 1.0
-                        compare_and_update(i, i - width + 1, ox, oy)
+                    # if x < width - 1:  # Top-Right
+                    #     ox, oy = -1.0, 1.0
+                    #     compare_and_update(i, i - width + 1, ox, oy)
 
         # 2 Pass: Bottom-Right to Top-Left
         for y in range(height - 1, -1, -1):
@@ -167,9 +167,9 @@ class SDFGenerator(Extension):
                     if x < width - 1:  # Bottom-Right
                         ox, oy = -1.0, -1.0
                         compare_and_update(i, i + width + 1, ox, oy)
-                    if x > 0:  # Bottom-Left
-                        ox, oy = 1.0, -1.0
-                        compare_and_update(i, i + width - 1, ox, oy)
+                    # if x > 0:  # Bottom-Left
+                    #     ox, oy = 1.0, -1.0
+                    #     compare_and_update(i, i + width - 1, ox, oy)
 
         # 3 Pass: Top-Right to Bottom-Left
         for y in range(height):
@@ -184,14 +184,14 @@ class SDFGenerator(Extension):
                     # Top
                     ox, oy = 0.0, 1.0
                     compare_and_update(i, i - width, ox, oy)
-                    if x > 0:  # Top-Left
-                        ox, oy = 1.0, 1.0
-                        compare_and_update(i, i - width - 1, ox, oy)
+                    # if x > 0:  # Top-Left
+                    #     ox, oy = 1.0, 1.0
+                    #     compare_and_update(i, i - width - 1, ox, oy)
                     if x < width - 1:  # Top-Right
                         ox, oy = -1.0, 1.0
                         compare_and_update(i, i - width + 1, ox, oy)
 
-        # 4 Pass: Bottom-Right to Top-Left
+        # 4 Pass: Bottom-Left to Top-Right
         for y in range(height - 1, -1, -1):
             y_coord = y * width
             for x in range(width):
@@ -207,9 +207,9 @@ class SDFGenerator(Extension):
                     if x > 0:  # Bottom-Left
                         ox, oy = 1.0, -1.0
                         compare_and_update(i, i + width - 1, ox, oy)
-                    if x < width - 1:  # Bottom-Right
-                        ox, oy = -1.0, -1.0
-                        compare_and_update(i, i + width + 1, ox, oy)
+                    # if x < width - 1:  # Bottom-Right
+                    #     ox, oy = -1.0, -1.0
+                    #     compare_and_update(i, i + width + 1, ox, oy)
 
         timings["8SSEDT"] = time.perf_counter() - t0
 
