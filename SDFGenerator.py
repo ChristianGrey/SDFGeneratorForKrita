@@ -55,40 +55,51 @@ class SDFGenerator(Extension):
         grid_dx = array("f", [infinity] * total_pixels)
         grid_dy = array("f", [infinity] * total_pixels)
 
+        grid_dx_in = array("f", [infinity] * total_pixels)
+        grid_dy_in = array("f", [infinity] * total_pixels)
+
         # is_inside stores the binary state (solid or not)
         is_inside = bytearray(total_pixels)
 
-        seed_idx = array(
+        seed_indexes = array(
             "I", [i for i in range(total_pixels)]
         )  # Track the index of the source pixel
+        seed_indexes_in = array(
+            "I", [i for i in range(total_pixels)]
+        )  # Track the index of the source pixel
+
         additional_dist = array("f", [0.0] * total_pixels)  # Track pre-squared Z-offset
+        additional_dist_in = array(
+            "f", [0.0] * total_pixels
+        )  # Track pre-squared Z-offset
 
         for i in range(total_pixels):
             offset = i * 4
-            r, g, b, a = (
+            b, g, r, a = (
                 pixels[offset],
                 pixels[offset + 1],
                 pixels[offset + 2],
                 pixels[offset + 3],
             )
 
-            # Simple luminance + alpha check
-            lum = 0.299 * r + 0.587 * g + 0.114 * b
-            if lum > 1:
+            if b > 127:
                 is_inside[i] = 1
-                # Seed the boundary
-                grid_dx[i] = 0.0
-                grid_dy[i] = 0.0
-                # Subpixel: how far inside are we?
-                z = 1.0 - (lum / 255)
-                additional_dist[i] = z  # * z
             else:
                 is_inside[i] = 0
+
+            if b > 1:
+                grid_dx[i] = 0.0
+                grid_dy[i] = 0.0
+                additional_dist[i] = 1.0 - (b / 255)
+            if b < 254:
+                grid_dx_in[i] = 0.0
+                grid_dy_in[i] = 0.0
+                additional_dist_in[i] = b / 255
 
         timings["Init"] = time.perf_counter() - t0
 
         # ---------------------------------------------------------
-        # BLOCK 3: 8SSEDT PASSES (THE CORE LOGIC)
+        # BLOCK 3: 8SSEDT PASS SETUP
         # ---------------------------------------------------------
         t0 = time.perf_counter()
 
@@ -102,34 +113,44 @@ class SDFGenerator(Extension):
 
         # offset from neighbor to target in coordinates
         def compare_and_update(
-            current_idx, neighbor_idx, offset_x, offset_y
+            current_idx,
+            neighbor_idx,
+            offset_x,
+            offset_y,
+            grid_x,
+            grid_y,
+            seed_idx,
+            add_dist,
         ):  # Calculate potential new vector using neighbor's existing displacement
-            new_x = grid_dx[neighbor_idx] + offset_x
-            new_y = grid_dy[neighbor_idx] + offset_y
+            new_x = grid_x[neighbor_idx] + offset_x
+            new_y = grid_y[neighbor_idx] + offset_y
 
             # Get the seed pixel that this neighbor is currently pointing to
             neighbor_seed = seed_idx[neighbor_idx]
 
             # New distance squared = X^2 + Y^2 + Precalculated_Z^2
             new_dist = (
-                math.sqrt((new_x * new_x) + (new_y * new_y))
-                + additional_dist[neighbor_seed]
+                math.sqrt((new_x * new_x) + (new_y * new_y)) + add_dist[neighbor_seed]
             )
 
             # Current distance squared
             curr_seed = seed_idx[current_idx]
             curr_dist = (
                 math.sqrt(
-                    (grid_dx[current_idx] * grid_dx[current_idx])
-                    + (grid_dy[current_idx] * grid_dy[current_idx])
+                    (grid_x[current_idx] * grid_x[current_idx])
+                    + (grid_y[current_idx] * grid_y[current_idx])
                 )
-                + additional_dist[curr_seed]
+                + add_dist[curr_seed]
             )
 
             if new_dist < curr_dist:
-                grid_dx[current_idx] = new_x
-                grid_dy[current_idx] = new_y
+                grid_x[current_idx] = new_x
+                grid_y[current_idx] = new_y
                 seed_idx[current_idx] = neighbor_seed
+
+        # ---------------------------------------------------------
+        # BLOCK 3.5: 8SSEDT PASSES
+        # ---------------------------------------------------------
 
         # 1 Pass: Top-Left to Bottom-Right
         for y in range(height):
@@ -137,16 +158,20 @@ class SDFGenerator(Extension):
             for x in range(width):
                 i = y_coord + x
                 # Check neighbors: Left, Top-Left, Top
-                if x > 0:  # Left
-                    ox, oy = 1.0, 0.0
-                    compare_and_update(i, i - 1, ox, oy)
-                if y > 0:
-                    # Top
-                    ox, oy = 0.0, 1.0
-                    compare_and_update(i, i - width, ox, oy)
-                    if x > 0:  # Top-Left
-                        ox, oy = 1.0, 1.0
-                        compare_and_update(i, i - width - 1, ox, oy)
+                for dx, dy, si, ad in [
+                    (grid_dx, grid_dy, seed_indexes, additional_dist),
+                    (grid_dx_in, grid_dy_in, seed_indexes_in, additional_dist_in),
+                ]:
+                    if x > 0:  # Left
+                        ox, oy = 1.0, 0.0
+                        compare_and_update(i, i - 1, ox, oy, dx, dy, si, ad)
+                    if y > 0:
+                        # Top
+                        ox, oy = 0.0, 1.0
+                        compare_and_update(i, i - width, ox, oy, dx, dy, si, ad)
+                        if x > 0:  # Top-Left
+                            ox, oy = 1.0, 1.0
+                            compare_and_update(i, i - width - 1, ox, oy, dx, dy, si, ad)
 
         # 2 Pass: Bottom-Right to Top-Left
         for y in range(height - 1, -1, -1):
@@ -154,16 +179,20 @@ class SDFGenerator(Extension):
             for x in range(width - 1, -1, -1):
                 i = y_coord + x
                 # Check neighbors: Right, Bottom-Right, Bottom
-                if x < width - 1:  # Right
-                    ox, oy = -1.0, 0.0
-                    compare_and_update(i, i + 1, ox, oy)
-                if y < height - 1:
-                    # Bottom
-                    ox, oy = 0.0, -1.0
-                    compare_and_update(i, i + width, ox, oy)
-                    if x < width - 1:  # Bottom-Right
-                        ox, oy = -1.0, -1.0
-                        compare_and_update(i, i + width + 1, ox, oy)
+                for dx, dy, si, ad in [
+                    (grid_dx, grid_dy, seed_indexes, additional_dist),
+                    (grid_dx_in, grid_dy_in, seed_indexes_in, additional_dist_in),
+                ]:
+                    if x < width - 1:  # Right
+                        ox, oy = -1.0, 0.0
+                        compare_and_update(i, i + 1, ox, oy, dx, dy, si, ad)
+                    if y < height - 1:
+                        # Bottom
+                        ox, oy = 0.0, -1.0
+                        compare_and_update(i, i + width, ox, oy, dx, dy, si, ad)
+                        if x < width - 1:  # Bottom-Right
+                            ox, oy = -1.0, -1.0
+                            compare_and_update(i, i + width + 1, ox, oy, dx, dy, si, ad)
 
         # 3 Pass: Top-Right to Bottom-Left
         for y in range(height):
@@ -171,16 +200,20 @@ class SDFGenerator(Extension):
             for x in range(width - 1, -1, -1):
                 i = y_coord + x
                 # Check neighbors: Right, Top-Right, Top
-                if x < width - 1:  # Right
-                    ox, oy = -1.0, 0.0
-                    compare_and_update(i, i + 1, ox, oy)
-                if y > 0:
-                    # Top
-                    ox, oy = 0.0, 1.0
-                    compare_and_update(i, i - width, ox, oy)
-                    if x < width - 1:  # Top-Right
-                        ox, oy = -1.0, 1.0
-                        compare_and_update(i, i - width + 1, ox, oy)
+                for dx, dy, si, ad in [
+                    (grid_dx, grid_dy, seed_indexes, additional_dist),
+                    (grid_dx_in, grid_dy_in, seed_indexes_in, additional_dist_in),
+                ]:
+                    if x < width - 1:  # Right
+                        ox, oy = -1.0, 0.0
+                        compare_and_update(i, i + 1, ox, oy, dx, dy, si, ad)
+                    if y > 0:
+                        # Top
+                        ox, oy = 0.0, 1.0
+                        compare_and_update(i, i - width, ox, oy, dx, dy, si, ad)
+                        if x < width - 1:  # Top-Right
+                            ox, oy = -1.0, 1.0
+                            compare_and_update(i, i - width + 1, ox, oy, dx, dy, si, ad)
 
         # 4 Pass: Bottom-Left to Top-Right
         for y in range(height - 1, -1, -1):
@@ -188,16 +221,20 @@ class SDFGenerator(Extension):
             for x in range(width):
                 i = y_coord + x
                 # Check neighbors: Left, Bottom, Bottom-Left
-                if x > 0:  # Left
-                    ox, oy = 1.0, 0.0
-                    compare_and_update(i, i - 1, ox, oy)
-                if y < height - 1:
-                    # Bottom
-                    ox, oy = 0.0, -1.0
-                    compare_and_update(i, i + width, ox, oy)
-                    if x > 0:  # Bottom-Left
-                        ox, oy = 1.0, -1.0
-                        compare_and_update(i, i + width - 1, ox, oy)
+                for dx, dy, si, ad in [
+                    (grid_dx, grid_dy, seed_indexes, additional_dist),
+                    (grid_dx_in, grid_dy_in, seed_indexes_in, additional_dist_in),
+                ]:
+                    if x > 0:  # Left
+                        ox, oy = 1.0, 0.0
+                        compare_and_update(i, i - 1, ox, oy, dx, dy, si, ad)
+                    if y < height - 1:
+                        # Bottom
+                        ox, oy = 0.0, -1.0
+                        compare_and_update(i, i + width, ox, oy, dx, dy, si, ad)
+                        if x > 0:  # Bottom-Left
+                            ox, oy = 1.0, -1.0
+                            compare_and_update(i, i + width - 1, ox, oy, dx, dy, si, ad)
 
         timings["8SSEDT"] = time.perf_counter() - t0
 
@@ -208,12 +245,17 @@ class SDFGenerator(Extension):
         out = bytearray(total_pixels * 4)
         for i in range(total_pixels):
             # Final Euclidean Distance + subpixel tweak
-            s_idx = seed_idx[i]
+            s_idx = seed_indexes[i]
+            s_idx_in = seed_indexes_in[i]
             dist = math.sqrt(grid_dx[i] ** 2 + grid_dy[i] ** 2) + additional_dist[s_idx]
+            dist_in = (
+                math.sqrt(grid_dx_in[i] ** 2 + grid_dy_in[i] ** 2)
+                + additional_dist_in[s_idx_in]
+            )
             # Normalize to 0.0 - 1.0 (0.5 is edge)
             if is_inside[i]:
                 # temp, we didn't make inside distances yet
-                val = 1
+                val = remap_clamped(dist_in, 1, max_range + 1, 0.5, 1)
             else:
                 # val = 0.5 * (1.0 - min(dist, max_range) / max_range)
                 val = remap_clamped(dist, 0, max_range + 1, 0.5, 0)
