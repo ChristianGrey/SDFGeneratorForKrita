@@ -41,8 +41,8 @@ class SDFGenerator(Extension):
                 c_int,  # width
                 c_int,  # height
                 POINTER(c_uint8),  # pixels
-                POINTER(c_float),  # out_dist
-                POINTER(c_float),  # out_dist_in
+                c_float,  # out_dist
+                POINTER(c_uint8),  # out_dist_in
             ]
             return True
         except Exception as e:
@@ -81,34 +81,15 @@ class SDFGenerator(Extension):
         # ---------------------------------------------------------
         t0 = time.perf_counter()
         pixel_data = node.pixelData(0, 0, width, height)
+        total_pixels = width * height
         # We use bytearray for fast read access
         pixels = bytearray(pixel_data)
         pixels_ptr = (c_uint8 * len(pixels)).from_buffer(pixels)
+
+        pixels_out = bytearray(total_pixels * 4)
+        pixels_out_ptr = (c_uint8 * len(pixels_out)).from_buffer(pixels_out)
+
         timings["Fetch"] = time.perf_counter() - t0
-
-        # ---------------------------------------------------------
-        # BLOCK 2: DECLARE ARRAYS
-        # ---------------------------------------------------------
-        t0 = time.perf_counter()
-        total_pixels = width * height
-        is_inside = bytearray(total_pixels)
-
-        dist_out = array("f", [0.0] * total_pixels)
-        dist_in_out = array("f", [0.0] * total_pixels)
-
-        p_dist_out = get_ptr(dist_out, c_float)
-        p_dist_in_out = get_ptr(dist_in_out, c_float)
-
-        for i in range(total_pixels):
-            offset = i * 4
-            b = pixels[offset]
-
-            if b > 127:
-                is_inside[i] = 1
-            else:
-                is_inside[i] = 0
-
-        timings["Init"] = time.perf_counter() - t0
 
         # ---------------------------------------------------------
         # BLOCK 3: 8SSEDT PASS SETUP
@@ -119,35 +100,16 @@ class SDFGenerator(Extension):
             width,  # width
             height,  # height
             pixels_ptr,  # pixels
-            p_dist_out,  # out_dist
-            p_dist_in_out,  # out_dist_in
+            max_range,
+            pixels_out_ptr,
         )
 
         timings["Compute"] = time.perf_counter() - t0
 
-        # ---------------------------------------------------------
-        # BLOCK 4: OUTPUT RENDERING
-        # ---------------------------------------------------------
-        t0 = time.perf_counter()
-        out = bytearray(total_pixels * 4)
-        for i in range(total_pixels):
-            if is_inside[i]:
-                # temp, we didn't make inside distances yet
-                val = remap_clamped(dist_in_out[i], 1, max_range + 1, 0.5, 1)
-            else:
-                # val = 0.5 * (1.0 - min(dist, max_range) / max_range)
-                val = remap_clamped(dist_out[i], 0, max_range + 1, 0.5, 0)
-
-            gray = int(val * 255)
-            offset = i * 4
-            out[offset] = out[offset + 1] = out[offset + 2] = gray
-            out[offset + 3] = 255
-        timings["Render"] = time.perf_counter() - t0
-
         # Create Layer
         new_node = doc.createNode("SDF_8SSEDT", "paintLayer")
         doc.rootNode().addChildNode(new_node, node)
-        new_node.setPixelData(bytes(out), 0, 0, width, height)
+        new_node.setPixelData(bytes(pixels_out), 0, 0, width, height)
         doc.refreshProjection()
 
         msg = "\n".join([f"{k}: {v * 1000:.2f}ms" for k, v in timings.items()])
