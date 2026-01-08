@@ -2,14 +2,55 @@ from krita import Krita, Extension
 from PyQt5.QtWidgets import QInputDialog, QMessageBox
 import math, time
 from array import array
+import ctypes
+from ctypes import POINTER, c_float, c_uint32, c_int
+import os
+
+
+def get_ptr(arr, type):
+    addr, count = arr.buffer_info()
+    return ctypes.cast(addr, POINTER(type))
 
 
 class SDFGenerator(Extension):
     def __init__(self, parent):
         super().__init__(parent)
+        self.c_compare = None
 
     def setup(self):
         pass
+
+    def init_c_library(self):
+        """Loads the DLL safely."""
+        if self.c_compare:
+            return True
+        try:
+            # Get the directory where THIS script is located
+            dir_path = os.path.dirname(os.path.realpath(__file__))
+            dll_path = os.path.join(dir_path, "sdf_logic.dll")
+
+            sdf_lib = ctypes.CDLL(dll_path)
+            if sdf_lib:
+                QMessageBox.information(None, "Lib loaded", "Success, Yay!")
+            else:
+                QMessageBox.information(
+                    None, "Lib not loaded", "Oh, no. How will we live?!?!"
+                )
+            self.c_compare = sdf_lib.process_compare
+            self.c_compare.argtypes = [
+                c_int,
+                c_int,
+                c_float,
+                c_float,
+                POINTER(c_float),
+                POINTER(c_float),
+                POINTER(c_uint32),
+                POINTER(c_float),
+            ]
+            return True
+        except Exception as e:
+            QMessageBox.critical(None, "SDF Error", f"Could not load DLL: {str(e)}")
+            return False
 
     def createActions(self, window):
         action = window.createAction(
@@ -18,6 +59,9 @@ class SDFGenerator(Extension):
         action.triggered.connect(self.run)
 
     def run(self):
+        if not self.init_c_library():
+            return
+
         app = Krita.instance()
         doc = app.activeDocument()
         if not doc:
@@ -45,7 +89,7 @@ class SDFGenerator(Extension):
         timings["Fetch"] = time.perf_counter() - t0
 
         # ---------------------------------------------------------
-        # BLOCK 2: INITIALIZE 8SSEDT GRIDS
+        # BLOCK 2: DECLARE ARRAYS
         # ---------------------------------------------------------
         t0 = time.perf_counter()
         total_pixels = width * height
@@ -72,6 +116,19 @@ class SDFGenerator(Extension):
         additional_dist_in = array(
             "f", [0.0] * total_pixels
         )  # Track pre-squared Z-offset
+
+        ptr_dx = get_ptr(grid_dx, c_float)
+        ptr_dy = get_ptr(grid_dy, c_float)
+        ptr_dx_in = get_ptr(grid_dx_in, c_float)
+        ptr_dy_in = get_ptr(grid_dy_in, c_float)
+        ptr_si = get_ptr(seed_indexes, c_uint32)
+        ptr_si_in = get_ptr(seed_indexes_in, c_uint32)
+        ptr_add_dist = get_ptr(additional_dist, c_float)
+        ptr_add_dist_in = get_ptr(additional_dist_in, c_float)
+
+        # ---------------------------------------------------------
+        # BLOCK 3: INITIALIZE 8SSEDT GRIDS
+        # ---------------------------------------------------------
 
         for i in range(total_pixels):
             offset = i * 4
@@ -158,20 +215,24 @@ class SDFGenerator(Extension):
             for x in range(width):
                 i = y_coord + x
                 # Check neighbors: Left, Top-Left, Top
+                # for dx, dy, si, ad in [
+                #     (grid_dx, grid_dy, seed_indexes, additional_dist),
+                #     (grid_dx_in, grid_dy_in, seed_indexes_in, additional_dist_in),
+                # ]:
                 for dx, dy, si, ad in [
-                    (grid_dx, grid_dy, seed_indexes, additional_dist),
-                    (grid_dx_in, grid_dy_in, seed_indexes_in, additional_dist_in),
+                    (ptr_dx, ptr_dy, ptr_si, ptr_add_dist),
+                    (ptr_dx_in, ptr_dy_in, ptr_si_in, ptr_add_dist_in),
                 ]:
                     if x > 0:  # Left
                         ox, oy = 1.0, 0.0
-                        compare_and_update(i, i - 1, ox, oy, dx, dy, si, ad)
+                        self.c_compare(i, i - 1, ox, oy, dx, dy, si, ad)
                     if y > 0:
                         # Top
                         ox, oy = 0.0, 1.0
-                        compare_and_update(i, i - width, ox, oy, dx, dy, si, ad)
+                        self.c_compare(i, i - width, ox, oy, dx, dy, si, ad)
                         if x > 0:  # Top-Left
                             ox, oy = 1.0, 1.0
-                            compare_and_update(i, i - width - 1, ox, oy, dx, dy, si, ad)
+                            self.c_compare(i, i - width - 1, ox, oy, dx, dy, si, ad)
 
         # 2 Pass: Bottom-Right to Top-Left
         for y in range(height - 1, -1, -1):
@@ -180,19 +241,19 @@ class SDFGenerator(Extension):
                 i = y_coord + x
                 # Check neighbors: Right, Bottom-Right, Bottom
                 for dx, dy, si, ad in [
-                    (grid_dx, grid_dy, seed_indexes, additional_dist),
-                    (grid_dx_in, grid_dy_in, seed_indexes_in, additional_dist_in),
+                    (ptr_dx, ptr_dy, ptr_si, ptr_add_dist),
+                    (ptr_dx_in, ptr_dy_in, ptr_si_in, ptr_add_dist_in),
                 ]:
                     if x < width - 1:  # Right
                         ox, oy = -1.0, 0.0
-                        compare_and_update(i, i + 1, ox, oy, dx, dy, si, ad)
+                        self.c_compare(i, i + 1, ox, oy, dx, dy, si, ad)
                     if y < height - 1:
                         # Bottom
                         ox, oy = 0.0, -1.0
-                        compare_and_update(i, i + width, ox, oy, dx, dy, si, ad)
+                        self.c_compare(i, i + width, ox, oy, dx, dy, si, ad)
                         if x < width - 1:  # Bottom-Right
                             ox, oy = -1.0, -1.0
-                            compare_and_update(i, i + width + 1, ox, oy, dx, dy, si, ad)
+                            self.c_compare(i, i + width + 1, ox, oy, dx, dy, si, ad)
 
         # 3 Pass: Top-Right to Bottom-Left
         for y in range(height):
@@ -201,19 +262,19 @@ class SDFGenerator(Extension):
                 i = y_coord + x
                 # Check neighbors: Right, Top-Right, Top
                 for dx, dy, si, ad in [
-                    (grid_dx, grid_dy, seed_indexes, additional_dist),
-                    (grid_dx_in, grid_dy_in, seed_indexes_in, additional_dist_in),
+                    (ptr_dx, ptr_dy, ptr_si, ptr_add_dist),
+                    (ptr_dx_in, ptr_dy_in, ptr_si_in, ptr_add_dist_in),
                 ]:
                     if x < width - 1:  # Right
                         ox, oy = -1.0, 0.0
-                        compare_and_update(i, i + 1, ox, oy, dx, dy, si, ad)
+                        self.c_compare(i, i + 1, ox, oy, dx, dy, si, ad)
                     if y > 0:
                         # Top
                         ox, oy = 0.0, 1.0
-                        compare_and_update(i, i - width, ox, oy, dx, dy, si, ad)
+                        self.c_compare(i, i - width, ox, oy, dx, dy, si, ad)
                         if x < width - 1:  # Top-Right
                             ox, oy = -1.0, 1.0
-                            compare_and_update(i, i - width + 1, ox, oy, dx, dy, si, ad)
+                            self.c_compare(i, i - width + 1, ox, oy, dx, dy, si, ad)
 
         # 4 Pass: Bottom-Left to Top-Right
         for y in range(height - 1, -1, -1):
@@ -222,19 +283,19 @@ class SDFGenerator(Extension):
                 i = y_coord + x
                 # Check neighbors: Left, Bottom, Bottom-Left
                 for dx, dy, si, ad in [
-                    (grid_dx, grid_dy, seed_indexes, additional_dist),
-                    (grid_dx_in, grid_dy_in, seed_indexes_in, additional_dist_in),
+                    (ptr_dx, ptr_dy, ptr_si, ptr_add_dist),
+                    (ptr_dx_in, ptr_dy_in, ptr_si_in, ptr_add_dist_in),
                 ]:
                     if x > 0:  # Left
                         ox, oy = 1.0, 0.0
-                        compare_and_update(i, i - 1, ox, oy, dx, dy, si, ad)
+                        self.c_compare(i, i - 1, ox, oy, dx, dy, si, ad)
                     if y < height - 1:
                         # Bottom
                         ox, oy = 0.0, -1.0
-                        compare_and_update(i, i + width, ox, oy, dx, dy, si, ad)
+                        self.c_compare(i, i + width, ox, oy, dx, dy, si, ad)
                         if x > 0:  # Bottom-Left
                             ox, oy = 1.0, -1.0
-                            compare_and_update(i, i + width - 1, ox, oy, dx, dy, si, ad)
+                            self.c_compare(i, i + width - 1, ox, oy, dx, dy, si, ad)
 
         timings["8SSEDT"] = time.perf_counter() - t0
 
